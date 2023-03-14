@@ -3,13 +3,21 @@ import { useEffect} from 'react'
 import './index.css';
 import io from 'socket.io-client'
 const socket = io.connect('http://localhost:3002');
+const rtcConfig = {
+  iceServers: [{ urls: "stun:stun1.l.google.com:19302" }]
+};
+let remoteStream = new MediaStream();
+
 function App() {
   const [userid,setUserid] = useState(0);
+  const candidateRef = useRef([]);
   const useridRef = useRef(0);
-  const imgRef = useRef();
-  const canvasRef = useRef();
+  const videoRef = useRef();
+  const videoDivRef = useRef();
+  const pcRef = useRef(new RTCPeerConnection(rtcConfig));
   const [userChannelJoined,setUserChannelJoined] = useState(false);
   const [beid,setBeid] = useState(0); 
+  const beidRef = useRef(0);
   const [newRequest,setNewRequest] = useState(true);
   const [remoteAccessResponse,setRemoteAccessResponse] = useState(false);
   const [waitingForResponse,setWaitingForResponse] = useState(true);
@@ -23,8 +31,8 @@ function App() {
     socket.on("remote-access-ack",(msg) => {
       if(msg.res){
         console.log("Received ACK");
-        // WHY IS THIS HAPPENING TWICE
         socket.emit('join-remote-channel',{userid: useridRef.current, beid: msg.userid})
+        beidRef.current = msg.userid;
         setWaitingForResponse(false)
         setRemoteAccessResponse(true)
       }
@@ -35,21 +43,110 @@ function App() {
       }
     })
     socket.on("remote-user-joined", (msg)=>{
-      if(msg.seid) setSocketMessage(`You are connected`)
+      if(msg.seid) {
+        setSocketMessage(`You are connected`);
+      }
     })
 
-    socket.on("remote-stream",(msg) => {
-      let context = canvasRef.current.getContext('2d')
-      canvasRef.current.width = 900;
-      canvasRef.current.height = 700;
-      context.width = canvasRef.current.width;
-      context.height = canvasRef.current.height;
-      //imgRef.current.src = msg.stream
-      let i = setInterval(() => {
-        context.drawImage(msg.stream,0,0,context.width,context.height)
-      },10);
+    socket.on("remote-offer", async (msg) => {
+      console.log("OFFER RECEIVED")
+      startPeerConnection();
+      await setRemoteDescriptionFun(msg.offer);
+      let answerSDP = await createAnswer();
+      socket.emit("remote-answer",{answer: answerSDP, userid: useridRef.current, beid: msg.beid});
     })
+
+    socket.on("remote-ice-candidate", async (msg) => {
+      console.log("CANDIDATE RECEIVED : ",msg.candidate);
+      candidateRef.current = [...candidateRef.current,msg.candidate]
+      //throttleFunction(addCandidate,250)();
+      await addCandidate()
+    })
+
+    return () => {
+      socket.removeAllListeners();
+    }
   },[])
+  const videoDivStyle = {
+    position: 'absolute',
+    top:'0px',
+    right:'0px',
+    bottom:'0px',
+    left: '0px',
+  }
+  const throttleFunction=(func, delay)=>{
+    let prev = 0;
+    return (...args) => {
+      let now = new Date().getTime();
+      if(now - prev> delay){
+        prev = now;
+        return func(...args); 
+      }
+    }
+  }
+  const debounce = (func, timeout = 300) => {
+    let timer;
+    return (...args) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { func.apply(this, args); }, timeout);
+    };
+  }
+  const startPeerConnection = () => {
+    const _pc = new RTCPeerConnection(rtcConfig);
+    _pc.onicecandidate = (e) => {
+      if(e.candidate){
+        // socket.emit("remote-ice-candidate",{ candidate: JSON.stringify(e.candidate),
+        //   userid: useridRef.current,
+        //   seid: seidRef.current})
+        console.log("Candidate Created : ",useridRef.current)
+      }
+    }
+    _pc.oniceconnectionstatechange = (e) => {
+      console.log("ICE Conn State Change : ", e)
+    }
+    _pc.ontrack = (e) => {
+      // receive the video stream
+      console.log("Stream Received");
+      console.log(e.streams.length);
+      // e.streams[0].getTracks((track)=>{
+      //   remoteStream.addTrack(track)
+      // })
+      // if(!videoRef.current.srcObject){
+      //   videoRef.current.srcObject = e.streams[0];
+      //   videoRef.current.onloadedmetadata = (e) => videoRef.current.play()
+      // }
+      videoDivRef.current.style = videoDivStyle
+      videoRef.current.srcObject = e.streams[0];
+      videoRef.current.onloadedmetadata = (e) => videoRef.current.play()
+    } 
+    pcRef.current = _pc
+  }
+
+  const createAnswer = async () => {
+    try{
+      const answerSDP = await pcRef.current.createAnswer()
+      pcRef.current.setLocalDescription(answerSDP);
+      return JSON.stringify(answerSDP);
+    }
+    catch(e){
+      console.log("Error : ",e)
+    }
+  }
+
+  const setRemoteDescriptionFun = async (offer) => {
+    const offerSDPReceived = JSON.parse(offer);
+    await pcRef.current.setRemoteDescription(new RTCSessionDescription(offerSDPReceived));
+  }
+
+  const addCandidate = async () => {
+    candidateRef.current.forEach( (candidate)=>{
+      pcRef.current.addIceCandidate(JSON.parse(candidate))
+      .then(() => {
+        console.log("ADDED ICE CANDIDATES");
+      })
+      .catch(err => console.log(err))
+    })
+  }
 
   const joinUserChannel = () => {
     setUserChannelJoined(true);
@@ -70,6 +167,23 @@ function App() {
     setWaitingForResponse(true);
     setRemoteAccessResponse(false);
     setNewRequest(true);
+  }
+
+  const handleMouseClick = () => {
+    console.log("Mouse Click");
+  }
+
+  const handleMouseMove = ({clientX,clientY}) => {
+    console.log("Mouse Move");
+    if(beidRef.current){
+      socket.emit('remote-mouse-move', {
+        clientX,clientY, 
+        clientWidth: window.innerWidth,
+        clientHeight: window.innerHeight,
+        userid: useridRef.current,
+        beid: beidRef.current
+      })
+    }
   }
 
   return (
@@ -102,8 +216,9 @@ function App() {
       {
         (socketMessage) ? <p>{socketMessage}</p> : null
       }
-      <img ref={imgRef}></img>
-      <canvas ref={canvasRef}  id="preview"></canvas>
+      <div ref={videoDivRef} style={{display: 'block',backgroundColor: 'black',margin: 0}} onMouseMove={debounce(handleMouseMove,100)} onClick={handleMouseClick}>
+          <video ref={videoRef} autoPlay={true}>video not available</video>
+      </div>
       <button onClick={handleLogOut}>Logout</button>
     </div>
   );
